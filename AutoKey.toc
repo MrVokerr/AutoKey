@@ -1,0 +1,9 @@
+## Interface: 120000
+## Interface-Retail: 120000
+## Title: Auto Key
+## Notes: Automatically inserts your Mythic+ keystone when the keystone window is opened.
+## Author: Vokerr
+## Version: 1
+## SavedVariables: AutoKeyDB
+
+AutoKey.lua
