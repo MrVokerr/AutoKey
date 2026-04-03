@@ -193,10 +193,80 @@ end
 local countdownBtn
 local readyCheckBtn
 local countdownRunning = false
+local waitingForCountdownStart = false
+local pendingCountdownGUID = nil
+local countdownSequenceToken = 0
+
+local COUNTDOWN_SECONDS = 10
+local COUNTDOWN_SYNC_TIMEOUT = 4.5
+local ACTIVATE_CLICK_DELAY = 0.2
 
 -- Cached reference to ChallengesKeystoneFrame's Activate button.
 -- Populated the first time the keystone window opens.
 local keystoneActivateBtn = nil
+
+local function ResetCountdownState()
+    waitingForCountdownStart = false
+    pendingCountdownGUID = nil
+    countdownRunning = false
+    countdownSequenceToken = countdownSequenceToken + 1
+    if countdownBtn then
+        countdownBtn:SetEnabled(true)
+    end
+end
+
+local function StartKeySequence(countdownSeconds, source)
+    local seconds = tonumber(countdownSeconds) or COUNTDOWN_SECONDS
+    seconds = math.floor(seconds + 0.5)
+    if seconds < 1 then
+        seconds = COUNTDOWN_SECONDS
+    end
+
+    waitingForCountdownStart = false
+    pendingCountdownGUID = nil
+    countdownRunning = true
+    countdownSequenceToken = countdownSequenceToken + 1
+    local token = countdownSequenceToken
+
+    Debug(("Starting synced countdown (%s): %d second(s)"):format(source or "unknown", seconds))
+
+    -- Send chat countdown in lockstep with the Blizzard countdown start.
+    for i = seconds, 1, -1 do
+        C_Timer.After(seconds - i, function()
+            if token ~= countdownSequenceToken or not countdownRunning then
+                return
+            end
+            local channel = IsInGroup() and "PARTY" or "SAY"
+            SendChatMessage("KEY STARTING IN " .. i, channel)
+        end)
+    end
+
+    C_Timer.After(seconds, function()
+        if token ~= countdownSequenceToken then
+            return
+        end
+        countdownRunning = false
+        if countdownBtn then
+            countdownBtn:SetEnabled(true)
+        end
+    end)
+
+    -- Click the Activate button shortly after countdown reaches 0.
+    C_Timer.After(seconds + ACTIVATE_CLICK_DELAY, function()
+        if token ~= countdownSequenceToken then
+            return
+        end
+        if not keystoneActivateBtn then
+            keystoneActivateBtn = FindActivateButton()
+        end
+        if keystoneActivateBtn and keystoneActivateBtn:IsShown() and keystoneActivateBtn:IsEnabled() then
+            keystoneActivateBtn:Click("LeftButton")
+            Debug("Activate button clicked")
+        else
+            Debug("Activate button not clickable — use /ak scanframe while window is open")
+        end
+    end)
+end
 
 -- Scans the ChallengesKeystoneFrame hierarchy (up to 3 levels deep) and
 -- returns the first button whose global name contains "Activate" or whose
@@ -286,7 +356,7 @@ local function BuildCountdownButton()
     -- /pull 10 is BigWigs' pull timer command — triggers the visible
     -- countdown for the whole group. Falls back to /countdown 10 if /pull
     -- isn't registered (i.e. BigWigs not loaded).
-    countdownBtn:SetAttribute("macrotext", "/pull 10")
+    countdownBtn:SetAttribute("macrotext", "/pull " .. COUNTDOWN_SECONDS)
 
     -- Show/hide with the keystone frame since we're parented to UIParent.
     ChallengesKeystoneFrame:HookScript("OnShow", function()
@@ -295,8 +365,7 @@ local function BuildCountdownButton()
     ChallengesKeystoneFrame:HookScript("OnHide", function()
         countdownBtn:Hide()
         -- Reset if the window is closed mid-countdown
-        countdownRunning = false
-        countdownBtn:SetEnabled(true)
+        ResetCountdownState()
     end)
 
     countdownBtn:SetScript("OnEnter", function(self)
@@ -312,8 +381,7 @@ local function BuildCountdownButton()
     -- PostClick fires in the addon (insecure) environment after the secure
     -- macro action (/pull 10) has already executed.
     countdownBtn:SetScript("PostClick", function(self)
-        if countdownRunning then return end
-        countdownRunning = true
+        if countdownRunning or waitingForCountdownStart then return end
         self:SetEnabled(false)
 
         -- Pre-resolve the activate button (we are out of combat here at the Font).
@@ -326,35 +394,17 @@ local function BuildCountdownButton()
             Debug("Could not find Activate button — use /ak scanframe to debug")
         end
 
-        -- Always send the chat countdown regardless of BigWigs.
-        -- /pull 10 handles the visual timer for BigWigs users;
-        -- the chat messages give everyone a countdown they can see.
-        for i = 10, 1, -1 do
-            C_Timer.After(10 - i, function()
-                local channel = IsInGroup() and "PARTY" or "SAY"
-                SendChatMessage("KEY STARTING IN " .. i, channel)
-            end)
-        end
+        -- BigWigs starts from START_PLAYER_COUNTDOWN, which can be delayed.
+        -- Wait for that event so chat + activation stay in sync.
+        waitingForCountdownStart = true
+        pendingCountdownGUID = UnitGUID("player")
+        Debug("Waiting for START_PLAYER_COUNTDOWN to sync chat with pull timer")
 
-        C_Timer.After(10, function()
-            countdownRunning = false
-            if countdownBtn then
-                countdownBtn:SetEnabled(true)
-            end
-        end)
-
-        -- Click the Activate button 0.2s after the countdown ends.
-        -- Out-of-combat button clicks are never tainted, so a plain Click()
-        -- works fine here without any secure plumbing.
-        C_Timer.After(10.2, function()
-            if not keystoneActivateBtn then
-                keystoneActivateBtn = FindActivateButton()
-            end
-            if keystoneActivateBtn and keystoneActivateBtn:IsShown() and keystoneActivateBtn:IsEnabled() then
-                keystoneActivateBtn:Click("LeftButton")
-                Debug("Activate button clicked")
-            else
-                Debug("Activate button not clickable — use /ak scanframe while window is open")
+        -- Fallback for cases where /pull is unavailable or blocked.
+        C_Timer.After(COUNTDOWN_SYNC_TIMEOUT, function()
+            if waitingForCountdownStart then
+                Debug("No START_PLAYER_COUNTDOWN event received, using local fallback timer")
+                StartKeySequence(COUNTDOWN_SECONDS, "fallback")
             end
         end)
     end)
@@ -375,6 +425,8 @@ eventFrame:RegisterEvent("CHALLENGE_MODE_KEYSTONE_RECEPTABLE_OPEN")
 -- Fallback trigger: the interaction manager fires for every player interaction frame.
 -- We filter for the ChallengeMode type which covers the keystone slot object.
 eventFrame:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+eventFrame:RegisterEvent("START_PLAYER_COUNTDOWN")
+eventFrame:RegisterEvent("CANCEL_PLAYER_COUNTDOWN")
 
 eventFrame:RegisterEvent("ADDON_LOADED")
 
@@ -429,6 +481,25 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             Debug("PlayerInteractionManager: ChallengeMode")
             BuildCountdownButton()
             TryInsertKeystone()
+        end
+
+    elseif event == "START_PLAYER_COUNTDOWN" then
+        local initiatedBy, timeSeconds, totalTime = ...
+        if not waitingForCountdownStart then
+            return
+        end
+
+        if pendingCountdownGUID and initiatedBy and initiatedBy ~= pendingCountdownGUID then
+            Debug("Ignoring START_PLAYER_COUNTDOWN from another player")
+            return
+        end
+
+        StartKeySequence(totalTime or timeSeconds or COUNTDOWN_SECONDS, "START_PLAYER_COUNTDOWN")
+
+    elseif event == "CANCEL_PLAYER_COUNTDOWN" then
+        if waitingForCountdownStart or countdownRunning then
+            Debug("Player countdown canceled, resetting state")
+            ResetCountdownState()
         end
     end
 end)
