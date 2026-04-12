@@ -5,7 +5,7 @@
 
 local addonName = ...
 
-local ADDON_VERSION = "1"
+local ADDON_VERSION = "1.1"
 local INSERT_DELAY  = 0.25   -- seconds to wait after receptacle opens before inserting
 
 -- =============================================================================
@@ -18,6 +18,7 @@ local defaults = {
 }
 
 local db  -- set on ADDON_LOADED to the AutoKeyDB SavedVariable table
+local Debug
 
 -- =============================================================================
 -- C_ChallengeMode dedicated APIs (the correct way to slot a keystone)
@@ -79,7 +80,7 @@ local function Msg(msg)
     print(CHAT_PREFIX .. msg)
 end
 
-local function Debug(msg)
+function Debug(msg)
     if db and db.verbose then
         print(CHAT_PREFIX .. "|cFFAAAAAA[debug]|r " .. msg)
     end
@@ -186,8 +187,8 @@ end
 -- Countdown Button
 -- Parented to UIParent and anchored to the LEFT of ChallengesKeystoneFrame
 -- so it sits outside the window and is never covered by internal frame layers.
--- Uses SecureActionButtonTemplate for /countdown (RunMacroText is blocked in
--- Midnight). PostClick handles the party chat messages.
+-- Uses click handlers (instead of secure macro attributes) so it reliably
+-- triggers countdown/ready-check APIs in Midnight.
 -- =============================================================================
 
 local countdownBtn
@@ -204,6 +205,75 @@ local ACTIVATE_CLICK_DELAY = 0.2
 -- Cached reference to ChallengesKeystoneFrame's Activate button.
 -- Populated the first time the keystone window opens.
 local keystoneActivateBtn = nil
+local FindActivateButton
+
+local function TriggerReadyCheck()
+    if not IsInGroup() then
+        Debug("Ready check skipped: not in a group")
+        return false
+    end
+
+    if type(DoReadyCheck) == "function" then
+        local ok, err = pcall(DoReadyCheck)
+        if ok then
+            Debug("Ready check started via DoReadyCheck")
+            return true
+        end
+        Debug("DoReadyCheck failed: " .. tostring(err))
+    end
+
+    if C_PartyInfo and type(C_PartyInfo.DoReadyCheck) == "function" then
+        local ok, err = pcall(C_PartyInfo.DoReadyCheck)
+        if ok then
+            Debug("Ready check started via C_PartyInfo.DoReadyCheck")
+            return true
+        end
+        Debug("C_PartyInfo.DoReadyCheck failed: " .. tostring(err))
+    end
+
+    if SlashCmdList then
+        local slashReadyCheck = SlashCmdList.RAIDREADYCHECK or SlashCmdList.READYCHECK
+        if type(slashReadyCheck) == "function" then
+            local ok, err = pcall(slashReadyCheck, "")
+            if ok then
+                Debug("Ready check started via slash command")
+                return true
+            end
+            Debug("Ready check slash failed: " .. tostring(err))
+        end
+    end
+
+    Msg("|cFFFF4444Could not start ready check (API unavailable).|r")
+    return false
+end
+
+local function TriggerPullCountdown(seconds)
+    local duration = tonumber(seconds) or COUNTDOWN_SECONDS
+    if duration < 1 then
+        duration = COUNTDOWN_SECONDS
+    end
+
+    if C_PartyInfo and type(C_PartyInfo.DoCountdown) == "function" then
+        local ok, err = pcall(C_PartyInfo.DoCountdown, duration)
+        if ok then
+            Debug(("Requested pull countdown via C_PartyInfo.DoCountdown(%d)"):format(duration))
+            return true
+        end
+        Debug("C_PartyInfo.DoCountdown failed: " .. tostring(err))
+    end
+
+    if SlashCmdList and type(SlashCmdList.pull) == "function" then
+        local ok, err = pcall(SlashCmdList.pull, tostring(duration))
+        if ok then
+            Debug(("Requested pull countdown via /pull %d"):format(duration))
+            return true
+        end
+        Debug("SlashCmdList.pull failed: " .. tostring(err))
+    end
+
+    Msg("|cFFFF4444Could not start pull countdown (API unavailable).|r")
+    return false
+end
 
 local function ResetCountdownState()
     waitingForCountdownStart = false
@@ -236,7 +306,7 @@ local function StartKeySequence(countdownSeconds, source)
             if token ~= countdownSequenceToken or not countdownRunning then
                 return
             end
-            local channel = IsInGroup() and "PARTY" or "SAY"
+            local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "SAY")
             SendChatMessage("KEY STARTING IN " .. i, channel)
         end)
     end
@@ -271,7 +341,7 @@ end
 -- Scans the ChallengesKeystoneFrame hierarchy (up to 3 levels deep) and
 -- returns the first button whose global name contains "Activate" or whose
 -- visible text is "Activate"/"Start".  Falls back to well-known globals.
-local function FindActivateButton()
+FindActivateButton = function()
     if not ChallengesKeystoneFrame then return nil end
 
     -- Well-known names first (fastest path)
@@ -316,16 +386,15 @@ local function BuildCountdownButton()
     end
 
     -- ── Ready Check button ──────────────────────────────────────────────────
-    readyCheckBtn = CreateFrame("Button", "AutoKeyReadyCheckBtn", UIParent,
-        "UIPanelButtonTemplate,SecureActionButtonTemplate")
+    readyCheckBtn = CreateFrame("Button", "AutoKeyReadyCheckBtn", UIParent, "UIPanelButtonTemplate")
     readyCheckBtn:SetSize(160, 26)
     readyCheckBtn:SetFrameStrata("HIGH")
     -- Anchored to the left of the keystone frame, slightly above center
     readyCheckBtn:SetPoint("RIGHT", ChallengesKeystoneFrame, "LEFT", -8, 17)
     readyCheckBtn:SetText("Ready Check")
-
-    readyCheckBtn:SetAttribute("type", "macro")
-    readyCheckBtn:SetAttribute("macrotext", "/readycheck")
+    readyCheckBtn:SetScript("OnClick", function()
+        TriggerReadyCheck()
+    end)
 
     readyCheckBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -342,21 +411,13 @@ local function BuildCountdownButton()
     end)
 
     -- ── Countdown button ────────────────────────────────────────────────────
-    countdownBtn = CreateFrame("Button", "AutoKeyCountdownBtn", UIParent,
-        "UIPanelButtonTemplate,SecureActionButtonTemplate")
+    countdownBtn = CreateFrame("Button", "AutoKeyCountdownBtn", UIParent, "UIPanelButtonTemplate")
     countdownBtn:SetSize(160, 26)
     countdownBtn:SetFrameStrata("HIGH")
 
     -- Anchor: Countdown sits directly below the Ready Check button.
     countdownBtn:SetPoint("TOP", readyCheckBtn, "BOTTOM", 0, -4)
     countdownBtn:SetText("Countdown & Start Key")
-
-    -- /countdown 10 via the secure macro attribute — no RunMacroText needed.
-    countdownBtn:SetAttribute("type", "macro")
-    -- /pull 10 is BigWigs' pull timer command — triggers the visible
-    -- countdown for the whole group. Falls back to /countdown 10 if /pull
-    -- isn't registered (i.e. BigWigs not loaded).
-    countdownBtn:SetAttribute("macrotext", "/pull " .. COUNTDOWN_SECONDS)
 
     -- Show/hide with the keystone frame since we're parented to UIParent.
     ChallengesKeystoneFrame:HookScript("OnShow", function()
@@ -371,16 +432,14 @@ local function BuildCountdownButton()
     countdownBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_TOP")
         GameTooltip:SetText("Countdown & Start Key", 1, 1, 1)
-        GameTooltip:AddLine("Fires a 10-second BigWigs pull timer (/pull 10)", 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine("Starts a 10-second pull countdown", 0.8, 0.8, 0.8, true)
         GameTooltip:AddLine("Posts KEY STARTING IN # to party chat", 0.8, 0.8, 0.8, true)
         GameTooltip:AddLine("Automatically activates the keystone when countdown ends", 0.4, 1, 0.4, true)
         GameTooltip:Show()
     end)
     countdownBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-    -- PostClick fires in the addon (insecure) environment after the secure
-    -- macro action (/pull 10) has already executed.
-    countdownBtn:SetScript("PostClick", function(self)
+    countdownBtn:SetScript("OnClick", function(self)
         if countdownRunning or waitingForCountdownStart then return end
         self:SetEnabled(false)
 
@@ -398,9 +457,16 @@ local function BuildCountdownButton()
         -- Wait for that event so chat + activation stay in sync.
         waitingForCountdownStart = true
         pendingCountdownGUID = UnitGUID("player")
-        Debug("Waiting for START_PLAYER_COUNTDOWN to sync chat with pull timer")
+        Debug("Waiting for START_PLAYER_COUNTDOWN to sync chat with countdown")
 
-        -- Fallback for cases where /pull is unavailable or blocked.
+        -- Start the group countdown first (BigWigs route if present, API fallback otherwise).
+        if not TriggerPullCountdown(COUNTDOWN_SECONDS) then
+            Debug("Countdown API unavailable, using local fallback timer immediately")
+            StartKeySequence(COUNTDOWN_SECONDS, "local-fallback")
+            return
+        end
+
+        -- Fallback for cases where the countdown event never arrives.
         C_Timer.After(COUNTDOWN_SYNC_TIMEOUT, function()
             if waitingForCountdownStart then
                 Debug("No START_PLAYER_COUNTDOWN event received, using local fallback timer")
