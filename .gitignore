@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets and local config (never commit these)
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Logs and OS junk
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
